@@ -1,0 +1,210 @@
+---
+title: "Practical Machine Learning Project"
+author: "Chris Rank"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+    html_document:
+        pandoc_args: [
+            "+RTS", "-K64m",
+            "-RTS"
+        ]
+---
+### Introduction
+
+
+Doctors and health professions say "get more exercise!", but to get the maximum benefit it is helpful to know that the exercises are performed correctly.  Using data gathered from wearable fitness sensors we will train a model to identify five specific techniques for lifting a barbell in order to allow users to identify when they are performing the exercise correctly.
+
+### Load, partition and pre-process data
+
+
+```{r load_libs, results='hide', message=FALSE, cache=TRUE}
+library(data.table)
+library(ggplot2)
+library(AppliedPredictiveModeling)
+library(caret)
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+library(MASS)
+library(rattle)
+
+set.seed(60466)
+```
+
+Load the training and test sets from the data files and do a little tidying of the raw data before we begin modelling. Both sets consist of rows of 160 comma separated values with the first 159 columns used identically between the training and test sets.
+
+The final column _classe_ in the training set is the objective, while _problem_id_ in the test set is the problem number for the homework submission. These values are in no way equivalent and will be excluded from the models. There are a few other columns containing observation identifying information that we can reject out of hand. Columns 1-7 are used to identify individual data records and provide no performance data and are excluded without any further consideration. 
+
+```{r load_data, cache=TRUE}
+trn <- read.csv("pml-training.csv", na.strings=c("NA","#DIV/0!",""))
+tst <- read.csv("pml-testing.csv", na.strings=c("NA","#DIV/0!",""))
+```
+
+The total training set is ```r dim(trn)[1]``` rows. This is large enough to provide decently sized  training and cross validation sets without resorting to iterative partitioning but probably a bit small for a three part split. Divide the training data 60/40.
+
+```{r partition, cache=TRUE}
+inTrain <- createDataPartition(y=trn$classe, p=0.6, list=FALSE)
+trData <- trn[inTrain,]
+cvData <- trn[-inTrain,]
+```
+
+Deal with the columns with NAs or (near) zero variance. Inspecting the columns with NAs, the density of values is too low to reasonably impute values for missing entries. I arbitrarily chose 90% as a viable threshold for imputing, but in fact the number of non-NA values was extremely low in these columns so any NA is sufficient to exclude the column.
+
+If a column has no NAs, check to see if it has significant enough variance to merit inclusion in the set of predictors. 
+
+```{r nona_nzv, cache=TRUE}
+# get the set of (near) zero variance columns
+nzv <- nearZeroVar(trData)
+include <- c()
+for (i in 8:dim(trData)[2]) {
+    # if the index is not in the near zero variance list
+    # and it has no NAs include the column
+    if (!(i %in% nzv ) && sum(is.na(trData[,i])) == 0)
+        include <- c(include,i)
+}
+
+# refresh the training and cross validation sets
+trData <- trData[,include]
+cvData <- cvData[,include]
+```
+
+### Train the models
+
+We will train three different models to get a baseline sense of the upper bound accuarcy we can get using each. For model characteristics see the model list in [The caret Package](http://topepo.github.io/caret/modelList.html).
+
+
+The models we choose are: CART (rpart), Random Forest (rf) and Linear Discriminant Analysis (lda). Note that _rf_ and _lda_ are classification specific models while _rpart_ is considered dual use (i.e. classification and regression). 
+
+Note that for the initial training pass we will build the models without any pre-processing. We will revisit pre-processing after we have looked at the results from the models using the raw predictors.  
+
+##### CART
+
+```{r train_model_rpart, cache=TRUE}
+rpartNoPre <- train(classe ~ ., data = trData, method="rpart")
+```
+```{r echo=FALSE}
+print(rpartNoPre)
+```
+
+
+##### Random Forest
+
+```{r train_model_rf, cache=TRUE}
+rfNoPre <- train(classe ~ ., data = trData, method="rf")
+```
+```{r echo=FALSE}
+print(rfNoPre)
+```
+
+
+##### Linear Discriminant Analysis
+
+```{r train_model_lda, cache=TRUE}
+ldaNoPre <- train(classe ~ ., data = trData, method="lda")
+```
+```{r echo=FALSE}
+print(ldaNoPre)
+```
+
+
+Even before using the results to predict from the cross validation set we can compare the notional accuracy of the three models and make an initial cut and drop the CART model.
+
+#### Cross-Validation Prediction
+
+We will use our cross-validation data set to make an initial assessment of the surviving models. The random forest is our most likely model, but the extremely high accuracy it reports should make us suspicious of at least some degree of overfitting.
+
+```{r init_pred, cache=TRUE}
+# predict for RF and LDA
+pred_rfNoPre <- predict(rfNoPre, newdata=cvData)
+pred_ldaNoPre <- predict(ldaNoPre,newdata=cvData)
+
+# show the confusion matrices
+cm_rfNoPre <- confusionMatrix(pred_rfNoPre,cvData$classe)
+cm_ldaNoPre  <- confusionMatrix(pred_ldaNoPre,cvData$classe)
+```
+
+##### Random forest confusion matrix
+```{r echo = FALSE}
+print(cm_rfNoPre)
+```
+
+##### Linear discriminant analysis confusion matrix
+```{r echo = FALSE}
+print(cm_ldaNoPre)
+```
+
+
+As we can see when comparing the confusion matrices, the random forest accuracy result (OOB error `r round(1 - cm_rfNoPre$overall[1],4)`) holds up both in terms of comparison to the LDA matrix (OOB error: `r round(1 - cm_ldaNoPre$overall[1],4)`) and in absolute terms against the accuracy indicated by modeling the training set. This latter result is a bit unexpected since predictions using the cross-validation data should be at least slightly less accurate than the training set however it is still within the 95% CI for the accuracy and within bounds.
+
+
+### Pre-processing. 
+
+The excellent results seen in the validation set predictions argue against making any changes to avoid compromising the outcome. However, due to the large time cost with the random forest model, before we write off pre-processing entirely we should look at how much we can reduce the number of features while still capturing most of the variance in the model.
+
+
+```{r}
+prpca <- prcomp(trData[,-length(include)], scale=TRUE, center=TRUE)
+```
+```{r echo=FALSE}
+print(summary(prpca))
+```
+
+
+From the above we see that to keep 95% of the variance we can reduce the number of features from 52 to 25 (to retain 99% of the variation requires 36 features).
+
+
+Training the model with preprocessing to retain 95% of the variation
+```{r train_model_prerf, cache=TRUE, warning=FALSE, }
+rfPrePCA <- train(classe ~ ., data = trData, 
+                  preProcess=c("center","scale","pca"),method="rf")
+pred_rfPrePCA <- predict(rfPrePCA, newdata=cvData)
+cm_rfNoPre <- confusionMatrix(pred_rfNoPre,cvData$classe)
+```
+
+```{r echo=FALSE}
+print(rfPrePCA)
+```
+
+##### Pre-processed random forest confusion matrix
+
+```{r echo = FALSE}
+print(cm_rfNoPre)
+```
+
+
+Given the excellent outcome from the original random forest model without pre-processing we should only consider the pre-processed model if there are significant time savings gained using new model. Comparing the original random forest model time:
+
+```{r echo=FALSE}
+print(rfNoPre$times)
+```
+
+
+against the times from the pre-processed random forest model:
+
+
+```{r echo=FALSE}
+print(rfPrePCA$times)
+```
+
+we see that, while the pre-processing _final_ times are better the overall (_everything_) elapsed time is much greater. Accordingly, we will use the original random forest model for the final submission.
+
+### Submit Programming Answers
+
+Run the random forest model against the test data set and submit the answers.
+
+```{r problem_submit, cache=TRUE}
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+
+tstData <- tst[,include]
+if (dim(tstData)[2] != dim(trData)[2])
+    stop("Incorrect test data dimension")
+
+submit <- predict(rfNoPre, newdata=tstData)
+pml_write_files(submit)
+```
